@@ -14,7 +14,7 @@
 - 📦 **静态编译**: ~760KB，无需 libc/libstdc++/任何运行时
 - 🚀 **零配置**: `./mcp-shell-server` 直接启动，默认端口 8080
 - 🌐 **局域网可用**: 默认监听 `0.0.0.0`
-- 🔓 **无命令限制**: 所有 shell 命令默认放行
+- 🔓 **无命令限制**: 所有 shell 命令默认放行，风险自负
 - ⚡ **JSON-RPC 2.0** 基于 MCP Streamable HTTP 传输
 
 ---
@@ -94,16 +94,6 @@ apt install g++-aarch64-linux-gnu
 # 静态交叉编译
 aarch64-linux-gnu-g++ -std=c++11 -O2 -static -o mcp-shell-server mcp-shell-server.cpp -lpthread
 ```
-
-### 编译选项说明
-
-| 选项 | 说明 |
-|------|------|
-| `-std=c++11` | C++11 标准 |
-| `-O2` | 二级优化 |
-| `-static` | 静态链接，生成独立二进制 |
-| `-lpthread` | 链接 pthread（静态编译时必需） |
-| `strip` | 去除调试符号，减小体积（760KB→可选） |
 
 ---
 
