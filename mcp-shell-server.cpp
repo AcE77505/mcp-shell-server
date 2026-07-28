@@ -97,9 +97,15 @@ public:
     JsonBuilder() { buf = ""; }
     void clear() { buf = ""; }
 
-    void begin_object() { buf += '{'; }
+    void begin_object() {
+        if (!buf.empty() && buf.back() == '}') buf += ',';
+        buf += '{';
+    }
     void end_object() { buf += '}'; }
-    void begin_array() { buf += '['; }
+    void begin_array() {
+        if (!buf.empty() && buf.back() == ']') buf += ',';
+        buf += '[';
+    }
     void end_array() { buf += ']'; }
 
     void key(const std::string& k) {
@@ -650,22 +656,20 @@ private:
     std::string handle_options() {
         std::map<std::string,std::string> h;
         h["access-control-allow-origin"] = "*";
-        h["access-control-allow-methods"] = "POST, GET, OPTIONS";
+        h["access-control-allow-methods"] = "POST, GET, OPTIONS, DELETE";
         h["access-control-allow-headers"] = "*";
         h["access-control-max-age"] = "86400";
         return http_resp(204, "No Content", "text/plain", "", h);
     }
 
     std::string handle_get() {
-        JsonBuilder j;
-        j.begin_object();
-        j.key_string("name", MCP_SERVER_NAME);
-        j.key_string("version", MCP_SERVER_VERSION);
-        j.key_string("protocol", MCP_PROTOCOL_VERSION);
-        j.key_string("endpoint", MCP_ENDPOINT);
-        j.key_array("tools"); j.av_string("shell"); j.av_string("reset"); j.end_array();
-        j.end_object();
-        return http_resp(200, "OK", "application/json", j.str());
+        return http_resp(405, "Method Not Allowed", "text/plain", "Use POST /mcp");
+    }
+
+    std::string handle_delete() {
+        log_msg(LOG_INFO, "Session terminated by client");
+        initialized = false;
+        return http_resp(204, "No Content", "text/plain", "");
     }
 
     void handle_client(int fd) {
@@ -726,6 +730,7 @@ private:
         std::string resp;
         if (method == "OPTIONS") resp = handle_options();
         else if (method == "GET") resp = handle_get();
+        else if (method == "DELETE") resp = handle_delete();
         else if (method == "POST" && path == MCP_ENDPOINT) resp = dispatch(body, hdrs);
         else resp = http_resp(404, "Not Found", "text/plain", "Not Found");
 
