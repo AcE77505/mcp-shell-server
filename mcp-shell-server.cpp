@@ -2,6 +2,7 @@
  * Protocol: MCP 2025-11-25, Streamable HTTP, JSON-RPC 2.0
  * Tools: shell, status (all terminals + is_mine), stop (own only), reset
  * Build: g++ -std=c++11 -O2 -static -o mcp-shell-server mcp-shell-server.cpp -lpthread
+ * Usage: mcp-shell-server [-p PORT] [-f]
  */
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include <signal.h>
 #include <poll.h>
 #include <pthread.h>
+#include <dirent.h>
 
 #define PORT 8080
 #define EP "/mcp"
@@ -355,18 +357,250 @@ out:
     close(fd); pthread_detach(pthread_self()); return 0;
 }
 
+/* ---------------- -f : take over a port held by someone else ----------------
+ * Android has no dependable lsof, so: find the socket inode bound to PORT in
+ * /proc/net/tcp[6], then scan /proc/<pid>/fd for that inode to get the owner(s).
+ * Owners get SIGTERM, then SIGKILL if they survive.
+ * Processes of this very process tree are never killed: this server leaks its
+ * listening fd into every command child, so an inherited copy is not a real
+ * holder, and one of them may be the parent that launched this server.
+ */
+static unsigned long hex2ul(const char* s) {
+    unsigned long v = 0;
+    for (; *s; s++) {
+        char c = *s;
+        if (c >= '0' && c <= '9') v = v*16 + (unsigned long)(c - '0');
+        else if (c >= 'a' && c <= 'f') v = v*16 + (unsigned long)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v = v*16 + (unsigned long)(c - 'A' + 10);
+        else break;
+    }
+    return v;
+}
+
+/* socket inodes whose local port == port.  listen_only=true returns the actual
+   listeners; otherwise every bound state except LISTEN/TIME_WAIT/CLOSE. */
+static int port_inodes(int port, unsigned long* out, int max, bool listen_only = true) {
+    static const char* f2[2] = { "/proc/net/tcp", "/proc/net/tcp6" };
+    int n = 0;
+    for (int f = 0; f < 2; f++) {
+        FILE* fp = fopen(f2[f], "r");
+        if (!fp) continue;
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            char* tok[12]; int nt = 0; char* p = line;
+            while (*p && nt < 12) {
+                while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+                if (!*p) break;
+                tok[nt++] = p;
+                while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
+                if (*p) { *p = 0; p++; }
+            }
+            if (nt < 10 || !strchr(tok[0], ':')) continue;
+            char* c = strchr(tok[1], ':');
+            if (!c || (int)hex2ul(c + 1) != port) continue;
+            unsigned long st = hex2ul(tok[3]);
+            if (listen_only) { if (st != 0x0A) continue; }
+            else if (st == 0x0A || st == 0x06 || st == 0x07) continue;
+            unsigned long ino = strtoul(tok[9], 0, 10);
+            if (!ino) continue;
+            bool dup = false;
+            for (int i = 0; i < n; i++) if (out[i] == ino) { dup = true; break; }
+            if (!dup && n < max) out[n++] = ino;
+        }
+        fclose(fp);
+    }
+    return n;
+}
+
+/* pids owning any of the given socket inodes */
+static int fd_owners(const unsigned long* ino, int nino, pid_t* out, int max) {
+    int n = 0;
+    DIR* d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        const char* q = e->d_name; bool num = (*q != 0);
+        for (const char* r = q; *r; r++) if (*r < '0' || *r > '9') { num = false; break; }
+        if (!num) continue;
+        pid_t pid = (pid_t)atoi(q);
+        if (pid <= 0) continue;
+        char dp[64]; snprintf(dp, sizeof(dp), "/proc/%d/fd", pid);
+        DIR* f = opendir(dp);
+        if (!f) continue;
+        struct dirent* fe; bool hit = false;
+        while (!hit && (fe = readdir(f))) {
+            if (fe->d_name[0] == '.') continue;
+            char lp[128], tgt[160];
+            snprintf(lp, sizeof(lp), "%s/%s", dp, fe->d_name);
+            ssize_t r = readlink(lp, tgt, sizeof(tgt) - 1);
+            if (r <= 0) continue; tgt[r] = 0;
+            if (strncmp(tgt, "socket:[", 8)) continue;
+            unsigned long v = strtoul(tgt + 8, 0, 10);
+            for (int i = 0; i < nino; i++) if (ino[i] == v) { hit = true; break; }
+        }
+        closedir(f);
+        if (hit && n < max) out[n++] = pid;
+    }
+    closedir(d);
+    return n;
+}
+
+static void pid_label(pid_t pid, char* out, size_t n) {
+    static const char* fn[2] = { "cmdline", "comm" };
+    out[0] = 0;
+    for (int i = 0; i < 2 && !out[0]; i++) {
+        char p[80]; snprintf(p, sizeof(p), "/proc/%d/%s", pid, fn[i]);
+        int fd = open(p, O_RDONLY);
+        if (fd < 0) continue;
+        char b[256]; ssize_t r = read(fd, b, sizeof(b) - 1); close(fd);
+        if (r <= 0) continue;
+        b[r] = 0;
+        char* nl = strchr(b, '\n'); if (nl) *nl = 0;
+        if (b[0]) snprintf(out, n, "%s", b);
+    }
+    if (!out[0]) snprintf(out, n, "?");
+}
+
+/* parent of pid: /proc/<pid>/status, falling back to /proc/<pid>/stat */
+static bool proc_ppid(pid_t pid, pid_t* out) {
+    char p[80]; snprintf(p, sizeof(p), "/proc/%d/status", pid);
+    FILE* f = fopen(p, "r");
+    if (f) {
+        char line[256]; bool got = false;
+        while (fgets(line, sizeof(line), f)) if (!strncmp(line, "PPid:", 5)) { *out = (pid_t)atoi(line + 5); got = true; break; }
+        fclose(f);
+        if (got) return true;
+    }
+    snprintf(p, sizeof(p), "/proc/%d/stat", pid);
+    f = fopen(p, "r");
+    if (!f) return false;
+    char b[512]; size_t r = fread(b, 1, sizeof(b) - 1, f); fclose(f);
+    if (!r) return false;
+    b[r] = 0;
+    char* q = strrchr(b, ')');            /* comm may contain spaces and ')' */
+    if (!q || q[1] != ' ') return false;
+    *out = (pid_t)atoi(q + 3);
+    return true;
+}
+
+/* true = pid is this process or one of its ancestors.  *known is cleared when
+   the parent chain cannot be resolved, so callers can refuse to kill. */
+static bool in_my_tree(pid_t pid, bool* known) {
+    pid_t cur = getpid();
+    if (known) *known = true;
+    for (int i = 0; i < 64; i++) {
+        if (cur == pid) return true;
+        if (cur <= 1) break;
+        pid_t pp = 0;
+        if (!proc_ppid(cur, &pp)) { if (known) *known = false; return false; }
+        if (pp <= 0 || pp == cur) break;
+        cur = pp;
+    }
+    return false;
+}
+
+struct KillRes { int holders; int gone; int denied; int skipped; };
+
+static KillRes take_over_port(int port) {
+    KillRes k; k.holders = k.gone = k.denied = k.skipped = 0;
+    unsigned long ino[256]; pid_t pids[256];
+    int nino = port_inodes(port, ino, 256, true);
+    if (nino <= 0) { nino = port_inodes(port, ino, 256, false); if (nino > 0) log(LW, "port %d: no listener, only bound sockets", port); }
+    if (nino <= 0) { log(LW, "port %d: no bound socket found in /proc/net/tcp", port); return k; }
+    int np = fd_owners(ino, nino, pids, 256);
+    k.holders = np;
+    if (np <= 0) { log(LW, "port %d: socket found but no owning process is visible (permission?)", port); return k; }
+    /* Pre-pass.  The holders of one socket form a tree rooted at the process that
+       bound it, because every descendant inherits the fd.  So if one holder is
+       this process or an ancestor, the real owner is in our own tree as well:
+       killing the other holders cannot free the port and would only take out
+       unrelated commands of that server.  Refuse instead of killing anything. */
+    pid_t mine = 0, unseen = 0;
+    for (int i = 0; i < np; i++) {
+        bool known = true;
+        if (in_my_tree(pids[i], &known)) { if (!mine) mine = pids[i]; }
+        else if (!known) { if (!unseen) unseen = pids[i]; }
+    }
+    if (mine) {
+        char nm[128]; pid_label(mine, nm, sizeof(nm));
+        k.skipped = np;
+        log(LE, "port %d is held by this process tree (pid %d %s): nothing killed, start me from another parent", port, mine, nm);
+        return k;
+    }
+    if (unseen) {
+        char nm[128]; pid_label(unseen, nm, sizeof(nm));
+        k.skipped = np;
+        log(LE, "port %d: cannot attribute holder pid %d (%s): nothing killed", port, unseen, nm);
+        return k;
+    }
+    pid_t tried[256]; int nt = 0;
+    for (int i = 0; i < np; i++) {
+        char nm[128]; pid_label(pids[i], nm, sizeof(nm));
+        if (kill(pids[i], SIGTERM) == 0) { log(LI, "SIGTERM -> pid %d (%s)", pids[i], nm); tried[nt++] = pids[i]; }
+        else if (errno == ESRCH) { k.gone++; log(LI, "pid %d (%s) already gone", pids[i], nm); }
+        else if (errno == EPERM) { k.denied++; log(LE, "no permission to kill pid %d (%s)", pids[i], nm); }
+        else log(LW, "kill %d (%s): %s", pids[i], nm, strerror(errno));
+    }
+    for (int t = 0; t < 30; t++) {
+        int w = 0;
+        for (int i = 0; i < nt; i++) if (tried[i] > 0) { if (kill(tried[i], 0) != 0) tried[i] = 0; else w++; }
+        if (!w) break;
+        usleep(50000);
+    }
+    for (int i = 0; i < nt; i++) {
+        if (tried[i] <= 0) continue;
+        char nm[128]; pid_label(tried[i], nm, sizeof(nm));
+        if (kill(tried[i], SIGKILL) == 0) log(LW, "SIGKILL -> pid %d (%s)", tried[i], nm);
+        else if (errno == EPERM) { k.denied++; log(LE, "no permission to SIGKILL pid %d (%s)", tried[i], nm); }
+    }
+    for (int t = 0; t < 20; t++) {
+        int w = 0;
+        for (int i = 0; i < nt; i++) if (tried[i] > 0 && kill(tried[i], 0) == 0) w++;
+        if (!w) break;
+        usleep(50000);
+    }
+    for (int i = 0; i < nt; i++) {
+        if (tried[i] <= 0) { k.gone++; continue; }
+        if (kill(tried[i], 0) != 0) { tried[i] = 0; k.gone++; }
+        else { char nm[128]; pid_label(tried[i], nm, sizeof(nm)); log(LE, "pid %d (%s) survived SIGKILL", tried[i], nm); }
+    }
+    return k;
+}
+
 int main(int c, char** v) {
-    int port = PORT;
+    int port = PORT; bool force = false;
     for (int i = 1; i < c; i++) {
         if ((!strcmp(v[i],"-p")||!strcmp(v[i],"--port")) && i+1<c) { port=atoi(v[++i]); if(port<1||port>65535){log(LE,"bad port");return 1;} }
-        else if (!strcmp(v[i],"-h")||!strcmp(v[i],"--help")) { printf("MCP Shell Server\nUsage: %s [-p PORT]\n",v[0]); return 0; }
+        else if (!strcmp(v[i],"-f")||!strcmp(v[i],"--force")) force = true;
+        else if (!strcmp(v[i],"-h")||!strcmp(v[i],"--help")) { printf("MCP Shell Server\nUsage: %s [-p PORT] [-f]\n  -p PORT  listen port (default %d)\n  -f       if PORT is busy, kill the process holding it, then start\n",v[0],PORT); return 0; }
     }
     signal(SIGPIPE, SIG_IGN);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { log(LE, "socket"); return 1; }
     int opt = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in a; memset(&a,0,sizeof(a)); a.sin_family=AF_INET; a.sin_addr.s_addr=INADDR_ANY; a.sin_port=htons(port);
-    if (bind(fd, (sockaddr*)&a, sizeof(a)) < 0) { log(LE, "bind %d", port); close(fd); return 1; }
+    auto do_bind = [&]() -> int { return bind(fd, (sockaddr*)&a, sizeof(a)); };
+    if (do_bind() < 0) {
+        if (errno == EADDRINUSE && force) {
+            log(LI, "port %d is busy, -f: killing the holder(s)", port);
+            KillRes kr = take_over_port(port);
+            log(LI, "port %d: holders=%d killed=%d skipped=%d denied=%d", port, kr.holders, kr.gone, kr.skipped, kr.denied);
+            if (kr.denied) log(LE, "cannot signal %d holder(s) of port %d: permission denied, need root", kr.denied, port);
+            if (kr.holders > 0 && kr.skipped >= kr.holders) log(LE, "port %d: takeover refused, see the reason above", port);
+            if (do_bind() < 0) {
+                if (errno == EADDRINUSE) {
+                    log(LE, "port %d is still in use after -f", port);
+                    if (kr.denied) log(LE, "hint: permission denied while signalling a holder - run as root");
+                    else if (kr.holders <= 0) log(LE, "hint: the holder could not be identified in /proc - run as root");
+                } else log(LE, "bind %d: %s", port, strerror(errno));
+                close(fd); return 1;
+            }
+        } else {
+            log(LE, "bind %d: %s", port, strerror(errno));
+            if (errno == EADDRINUSE) log(LW, "port %d is busy; rerun with -f to kill the holder first", port);
+            close(fd); return 1;
+        }
+    }
     if (listen(fd, 128) < 0) { log(LE, "listen"); close(fd); return 1; }
     log(LI, "=== MCP Shell Server ==="); log(LI, "Port %d  EP: POST /mcp", port); log(LI, "http://<ip>:%d/mcp", port);
     while (1) {
